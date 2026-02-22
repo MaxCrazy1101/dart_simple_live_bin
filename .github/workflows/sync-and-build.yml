@@ -1,0 +1,110 @@
+name: Auto Build and Publish to AUR
+
+on:
+  schedule:
+    - cron: '0 2 * * *' # 每天 UTC 时间凌晨 2 点检查更新
+  workflow_dispatch: # 允许网页端手动触发
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-22.04 # 匹配原仓库环境
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout local repository
+        uses: actions/checkout@v4
+
+      - name: Check for new upstream tag
+        id: tag_check
+        run: |
+          # 1. 获取所有的 tag
+          # 2. 过滤掉包含 tv 的标签
+          # 3. 剥离前缀，提取纯数字版本号进行真正的语义化排序 (1.11.4 > 1.8.6)
+          # 4. 拿到纯数字最大的那个原始标签名称
+          UPSTREAM_TAG=$(curl -s https://api.github.com/repos/xiaoyaocz/dart_simple_live/git/refs/tags | jq -r '.[].ref' | sed 's|^refs/tags/||' | grep -v 'tv' | while read tag; do
+            version=$(echo "$tag" | grep -oP '\d+(\.\d+)+')
+            if [ ! -z "$version" ]; then
+              echo "$version $tag"
+            fi
+          done | sort -V -r -k1,1 | head -n 1 | awk '{print $2}')
+          
+          # 获取本地最新 Release 标签
+          LOCAL_TAG=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.tag_name // empty')
+          
+          echo "Upstream Tag: $UPSTREAM_TAG"
+          echo "Local Tag: $LOCAL_TAG"
+          
+          # 增加 -n "$UPSTREAM_TAG" 的判断，防止上游 API 崩溃时执行错误的编译
+          if [ "$UPSTREAM_TAG" != "$LOCAL_TAG" ] && [ -n "$UPSTREAM_TAG" ]; then
+            echo "NEW_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
+            echo "should_run=true" >> $GITHUB_ENV
+          else
+            echo "should_run=false" >> $GITHUB_ENV
+          fi
+
+      - name: Checkout upstream source code
+        if: env.should_run == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: xiaoyaocz/dart_simple_live
+          ref: ${{ env.NEW_TAG }}
+          path: upstream_source
+
+      - name: Setup Flutter
+        if: env.should_run == 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: "3.38.x" # 锁定原仓库版本
+          cache: true
+
+      - name: Install Linux Build Dependencies
+        if: env.should_run == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev libasound2-dev libmpv-dev mpv
+
+      - name: Enable Flutter Desktop & Build
+        if: env.should_run == 'true'
+        run: |
+          flutter config --enable-linux-desktop
+          cd upstream_source/simple_live_app # 进入真实源码目录
+          flutter pub get
+          flutter build linux --release
+
+      - name: Package compiled artifacts
+        if: env.should_run == 'true'
+        run: |
+          cd upstream_source/simple_live_app/build/linux/x64/release/bundle
+          tar -czvf ${{ github.workspace }}/simple-live-app-linux.tar.gz .
+
+      - name: Create GitHub Release
+        if: env.should_run == 'true'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.NEW_TAG }}
+          files: ${{ github.workspace }}/simple-live-app-linux.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update PKGBUILD & Generate .SRCINFO
+        if: env.should_run == 'true'
+        run: |
+          SHA256=$(sha256sum ${{ github.workspace }}/simple-live-app-linux.tar.gz | awk '{ print $1 }')
+          VERSION=$(echo ${{ env.NEW_TAG }} | sed 's/[^0-9.]*//g')
+          
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" PKGBUILD
+          sed -i "s/^sha256sums=('.*')/sha256sums=('$SHA256')/" PKGBUILD
+          sed -i "s|_tag=.*|_tag=${{ env.NEW_TAG }}|" PKGBUILD
+          
+          docker run --rm -v $PWD:/pkg -w /pkg archlinux /bin/bash -c "pacman -Sy --noconfirm base-devel sudo && useradd builduser -m && chown -R builduser:builduser /pkg && sudo -u builduser makepkg --printsrcinfo > .SRCINFO"
+
+      - name: Publish to AUR
+        if: env.should_run == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@v2.7.2
+        with:
+          pkgname: simple-live-app-bin
+          pkgbuild: ./PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Auto-update to ${{ env.NEW_TAG }}"
